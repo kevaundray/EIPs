@@ -68,30 +68,22 @@ document are to be interpreted as described in
 
 | Name | Value |
 | - | - |
-| `DOMAIN_AGGREGATOR_SELECTION` | `DomainType('0x13000000')` |
-| `DOMAIN_AGGREGATOR_COMMITMENT_REGISTRATION` | `DomainType('0x14000000')` |
-| `UNSET_AGGREGATOR_COMMITMENT` | `Bytes32()` |
+| `DOMAIN_AGGREGATOR_COMMITMENT_REGISTRATION` | `DomainType('0x13000000')` |
 
 ### New presets
 
 | Name | Value | Notes |
 | - | - | - |
 | `AGGREGATOR_COMMITMENT_TREE_DEPTH` | `uint64(24)` | one leaf per epoch, sized to outlast a validator |
-| `AGGREGATOR_COMMITMENT_REGISTRATION_DELAY` | `Epoch(3)` | at least `MIN_SEED_LOOKAHEAD + 2` |
-| `MAX_AGGREGATOR_COMMITMENT_REGISTRATIONS` | `uint64(2**7)` | per block |
+| `AGGREGATOR_COMMITMENT_REGISTRATION_DELAY` | `Epoch(3)` | at least `MIN_SEED_LOOKAHEAD + 2`, as `COMMITMENT_REGISTRATION_DELAY` in [EIP-8321](./eip-8321.md) |
+| `MAX_AGGREGATOR_COMMITMENT_REGISTRATIONS` | `uint64(128)` | per block |
 
 ### New containers
 
 ```python
 class AggregatorCommitment(Container):
     root: Bytes32
-    activation_epoch: Epoch
-
-
-class PendingAggregatorCommitment(Container):
-    validator_index: ValidatorIndex
-    root: Bytes32
-    activation_epoch: Epoch
+    activation_epoch: Epoch  # FAR_FUTURE_EPOCH until registered
 
 
 class AggregatorCommitmentRegistration(Container):
@@ -109,14 +101,17 @@ class AggregatorSelectionOpening(Container):
     branch: Vector[Bytes32, AGGREGATOR_COMMITMENT_TREE_DEPTH]
 ```
 
+The registration containers mirror EIP-8321's, with `commitment` named `root`
+since it is a Merkle root.
+
 ### Modified `AggregateAndProof`
 
 ```python
 class AggregateAndProof(Container):
     aggregator_index: ValidatorIndex
     aggregate: Attestation
-    selection_proof: BLSSignature  # transitional; MUST be the G2 point at infinity once the aggregator has an active commitment
-    selection_opening: AggregatorSelectionOpening  # [New in this EIP] zero unless the aggregator has an active commitment
+    selection_proof: BLSSignature  # transitional; the G2 point at infinity once the aggregator has an active commitment
+    selection_opening: AggregatorSelectionOpening  # [New in this EIP] zero until the aggregator has an active commitment
 ```
 
 `selection_proof` is retained transitionally: unregistered validators keep
@@ -125,20 +120,18 @@ self-selecting with it exactly as today until their commitment activates.
 ### Modified `BeaconState`
 
 ```python
+class AggregatorCommitments(ProgressiveList[AggregatorCommitment]):
+    pass
+
+
 class BeaconState(Container):
     ...
-    aggregator_commitments: ProgressiveList[AggregatorCommitment]  # [New in this EIP]
-    pending_aggregator_commitments: ProgressiveList[PendingAggregatorCommitment]  # [New in this EIP]
+    aggregator_commitments: AggregatorCommitments  # [New in this EIP]
 ```
 
-`aggregator_commitments` holds one entry per registry member, indexed by
-validator index. An entry with root `UNSET_AGGREGATOR_COMMITMENT` means no
-commitment is registered. An entry is written once and never updated.
-
-List types follow the target fork. From Gloas, per-validator lists are
-`ProgressiveList` ([EIP-7916](./eip-7916.md)); on an earlier fork,
-`aggregator_commitments` is `List[AggregatorCommitment, VALIDATOR_REGISTRY_LIMIT]`
-and the pending queue a bounded `List`.
+One entry per registry member, indexed by validator index, written once at
+registration and never updated. `ProgressiveList` is defined in
+[EIP-7916](./eip-7916.md).
 
 ### Modified `BeaconBlockBody`
 
@@ -173,28 +166,29 @@ def is_aggregator(state: BeaconState,
     modulo = max(uint64(1), uint64(len(committee)) // TARGET_AGGREGATORS_PER_COMMITTEE)
     epoch = compute_epoch_at_slot(slot)
     commitment = state.aggregator_commitments[aggregator_index]
-    if commitment.root == UNSET_AGGREGATOR_COMMITMENT or epoch < commitment.activation_epoch:
+    if epoch < commitment.activation_epoch:
         # Transitional: no commitment active at ``epoch``, use the legacy selection proof
         return bytes_to_uint64(hash(selection_proof)[0:8]) % modulo == 0
     leaf_index = get_aggregator_leaf_index(commitment, epoch)
     if leaf_index >= uint64(2**AGGREGATOR_COMMITMENT_TREE_DEPTH):
         return False
+    seed = get_seed(state, epoch, DOMAIN_SELECTION_PROOF)
+    if bytes_to_uint64(hash(opening.value + seed)[0:8]) % modulo != 0:
+        return False
     # The tree commits to the hash of each value, not the value itself
-    if not is_valid_merkle_branch(
+    return is_valid_merkle_branch(
         hash(opening.value),
         opening.branch,
         AGGREGATOR_COMMITMENT_TREE_DEPTH,
         leaf_index,
         commitment.root,
-    ):
-        return False
-    seed = get_seed(state, epoch, DOMAIN_AGGREGATOR_SELECTION)
-    return bytes_to_uint64(hash(opening.value + seed)[0:8]) % modulo == 0
+    )
 ```
 
-`state` may be any state at or after the epoch of `slot`. A commitment is
-registered once and carries its activation epoch, so a later state gives the same
-answer as a state at that epoch.
+The draw is checked before the branch, since it is one hash and rejects most
+arbitrary values. An entry is written once, at inclusion, so any state from the
+including block on holds it; `state` otherwise has the same requirements as
+today.
 
 ### New `process_aggregator_commitment_registration`
 
@@ -205,9 +199,8 @@ def process_aggregator_commitment_registration(
     registration = signed_registration.message
     index = registration.validator_index
     assert index < len(state.validators)
-    assert registration.root != UNSET_AGGREGATOR_COMMITMENT
     # One-time: valid only while the validator is unregistered
-    assert state.aggregator_commitments[index].root == UNSET_AGGREGATOR_COMMITMENT
+    assert state.aggregator_commitments[index].activation_epoch == FAR_FUTURE_EPOCH
     validator = state.validators[index]
     domain = compute_domain(
         DOMAIN_AGGREGATOR_COMMITMENT_REGISTRATION,
@@ -215,102 +208,48 @@ def process_aggregator_commitment_registration(
     )
     signing_root = compute_signing_root(registration, domain)
     assert bls.Verify(validator.pubkey, signing_root, signed_registration.signature)
-    queue_aggregator_commitment(state, index, registration.root)
+    state.aggregator_commitments[index] = AggregatorCommitment(
+        root=registration.root,
+        activation_epoch=Epoch(get_current_epoch(state) + AGGREGATOR_COMMITMENT_REGISTRATION_DELAY),
+    )
 ```
 
 Called from `process_operations` after the existing operations:
 
 ```python
-    assert len(body.aggregator_commitment_registrations) <= MAX_AGGREGATOR_COMMITMENT_REGISTRATIONS
     for_ops(body.aggregator_commitment_registrations, process_aggregator_commitment_registration)
 ```
 
-- The signature MUST verify under the validator's current signing key: BLS today,
-  the post-quantum scheme once BLS keys are retired. The signing domain uses the
-  genesis fork version, as for `BLSToExecutionChange`, so a registration stays
-  valid across forks until it is included.
+- The signing domain uses the genesis fork version, as in EIP-8321, so a
+  registration stays valid across forks until it is included.
 - Any validator in the registry may register once, including one still in the
-  activation queue. A registered commitment is never updated: a validator that
-  loses `s` or exhausts its tree exits and re-enters, as for a lost RANDAO chain
-  under [EIP-8321](./eip-8321.md).
-
-### New `queue_aggregator_commitment`
-
-At most one registration per validator may be pending at any time; a block
-containing a registration for a validator with an in-flight one is invalid.
-
-```python
-def queue_aggregator_commitment(state: BeaconState, index: ValidatorIndex, root: Bytes32) -> None:
-    assert all(pending.validator_index != index for pending in state.pending_aggregator_commitments)
-    state.pending_aggregator_commitments.append(
-        PendingAggregatorCommitment(
-            validator_index=index,
-            root=root,
-            activation_epoch=Epoch(get_current_epoch(state) + AGGREGATOR_COMMITMENT_REGISTRATION_DELAY),
-        )
-    )
-```
-
-### New `process_pending_aggregator_commitments`
-
-```python
-def process_pending_aggregator_commitments(state: BeaconState) -> None:
-    next_epoch = Epoch(get_current_epoch(state) + 1)
-    remaining: list[PendingAggregatorCommitment] = []
-    for pending in state.pending_aggregator_commitments:
-        if pending.activation_epoch <= next_epoch:
-            state.aggregator_commitments[pending.validator_index] = AggregatorCommitment(
-                root=pending.root,
-                activation_epoch=pending.activation_epoch,
-            )
-        else:
-            remaining.append(pending)
-    state.pending_aggregator_commitments = ProgressiveList[PendingAggregatorCommitment](remaining)
-```
-
-Called from `process_epoch` immediately after `process_registry_updates`. The
-position is not load-bearing.
+  activation queue.
+- The entry is written at inclusion with a future `activation_epoch`, and
+  `is_aggregator` takes the legacy path until then. No pending queue is needed;
+  EIP-8321 has one because its entry has nowhere to hold the activation epoch.
 
 ### Fork transition
 
-The `upgrade_to_*` function initialises `aggregator_commitments` with one unset
-entry per registry member and `pending_aggregator_commitments` as empty:
+`upgrade_to_*` initialises the new field, and `add_validator_to_registry` gains
+one line:
 
 ```python
-def upgrade_to_<fork>(pre: <PreForkState>) -> BeaconState:
-    post = BeaconState(
-        # ... existing fields carried over from `pre` ...
-        aggregator_commitments=[AggregatorCommitment() for _ in range(len(pre.validators))],
-        pending_aggregator_commitments=[],
-    )
-    return post
+    aggregator_commitments=[
+        AggregatorCommitment(activation_epoch=FAR_FUTURE_EPOCH) for _ in range(len(pre.validators))
+    ],
 ```
 
-`add_validator_to_registry` appends an unset entry alongside the other
-per-validator lists:
-
 ```python
-def add_validator_to_registry(state: BeaconState,
-                              pubkey: BLSPubkey,
-                              withdrawal_credentials: Bytes32,
-                              amount: uint64) -> None:
-    index = get_index_for_new_validator(state)
-    validator = get_validator_from_deposit(pubkey, withdrawal_credentials, amount)
-    set_or_append_list(state.validators, index, validator)
-    set_or_append_list(state.balances, index, amount)
-    set_or_append_list(state.previous_epoch_participation, index, ParticipationFlags(0b0000_0000))
-    set_or_append_list(state.current_epoch_participation, index, ParticipationFlags(0b0000_0000))
-    set_or_append_list(state.inactivity_scores, index, uint64(0))
-    set_or_append_list(state.aggregator_commitments, index, AggregatorCommitment())  # [New in this EIP]
+    set_or_append_list(state.aggregator_commitments, index, AggregatorCommitment(activation_epoch=FAR_FUTURE_EPOCH))  # [New in this EIP]
 ```
 
 ### Modified `beacon_aggregate_and_proof` gossip validation
 
-The existing check that the aggregator is within the committee,
-`aggregate_and_proof.aggregator_index in get_beacon_committee(state, aggregate.data.slot, index)`,
-is moved ahead of the selection check, so that `aggregator_index` is known to be
-in range before `aggregator_commitments` is indexed. The selection check is then:
+The selection checks become, in order:
 
+- `[REJECT]` if the aggregator has no commitment active at the attestation's
+  epoch, `selection_opening` is zero; otherwise `selection_proof` is the G2
+  point at infinity.
 - `[REJECT]` `is_aggregator(state, aggregate.data.slot, index,
   aggregate_and_proof.aggregator_index, aggregate_and_proof.selection_proof,
   aggregate_and_proof.selection_opening)`, where `index` is the committee index
@@ -318,19 +257,16 @@ in range before `aggregator_commitments` is indexed. The selection check is then
   [EIP-7549](./eip-7549.md).
 - `[REJECT]` if the aggregator has no commitment active at the attestation's
   epoch, `selection_proof` is a valid signature of `aggregate.data.slot` by the
-  validator, as today, and `selection_opening` is zero; otherwise
-  `selection_proof` is the G2 point at infinity.
+  validator, as today.
 
 ### New `aggregator_commitment_registration` gossip topic
 
 A new global gossip topic `aggregator_commitment_registration` carries
-`SignedAggregatorCommitmentRegistration` messages. A validator registers at most
-once, so first-seen-per-validator deduplication suffices, as for
-`bls_to_execution_change`.
+`SignedAggregatorCommitmentRegistration` messages, validated as EIP-8321's
+`randao_commitment_registration` topic, in order:
 
-- **[REJECT]** `root` is `UNSET_AGGREGATOR_COMMITMENT`, or `validator_index` is unknown.
-- **[IGNORE]** a registration for `validator_index` has already been seen, or a
-  pending registration for it exists in the node's view of the head state.
+- **[REJECT]** `validator_index` is unknown.
+- **[IGNORE]** a registration for `validator_index` has already been seen.
 - **[REJECT]** the validator is already registered in the node's view of the head
   state.
 - **[REJECT]** the signature is invalid.
@@ -344,27 +280,24 @@ def get_aggregate_and_proof(state: BeaconState,
                             privkey: int,
                             opening: AggregatorSelectionOpening) -> AggregateAndProof:
     commitment = state.aggregator_commitments[aggregator_index]
-    epoch = compute_epoch_at_slot(aggregate.data.slot)
-    if commitment.root == UNSET_AGGREGATOR_COMMITMENT or epoch < commitment.activation_epoch:
+    if compute_epoch_at_slot(aggregate.data.slot) < commitment.activation_epoch:
         # Transitional: legacy selection proof
-        return AggregateAndProof(
-            aggregator_index=aggregator_index,
-            aggregate=aggregate,
-            selection_proof=get_slot_signature(state, aggregate.data.slot, privkey),
-            selection_opening=AggregatorSelectionOpening(),
-        )
+        selection_proof = get_slot_signature(state, aggregate.data.slot, privkey)
+        opening = AggregatorSelectionOpening()
+    else:
+        selection_proof = BLSSignature(G2_POINT_AT_INFINITY)
     return AggregateAndProof(
         aggregator_index=aggregator_index,
         aggregate=aggregate,
-        selection_proof=BLSSignature(G2_POINT_AT_INFINITY),
+        selection_proof=selection_proof,
         selection_opening=opening,
     )
 ```
 
 `opening` carries `v_i` and its branch for
 `i = get_aggregator_leaf_index(commitment, compute_epoch_at_slot(aggregate.data.slot))`.
-A validator decides whether to aggregate by calling `is_aggregator` with the same
-arguments a verifier will use.
+A validator decides whether to aggregate with the same `is_aggregator` call a
+verifier makes.
 
 ### Leaf derivation
 
@@ -380,12 +313,6 @@ any leaf is recomputable from 32 bytes rather than storing
 `2**AGGREGATOR_COMMITMENT_TREE_DEPTH` values. The tree is built over `hash(v_i)`,
 and the opening for index `i` carries `v_i`.
 
-An opening also needs the `AGGREGATOR_COMMITMENT_TREE_DEPTH` sibling nodes, so a
-validator holding only `s` would rebuild the whole tree, about `3 * 2**depth`
-hashes, for every duty. Clients SHOULD instead cache the top `depth - k` levels
-and rebuild only the `2**k` leaf subtree containing the duty leaf; with `k = 12`
-at depth 24 that is 256 KB per validator and about 12,000 hashes per opening.
-
 The validator index term means a secret shared across a fleet still yields a
 distinct tree per validator. Without it, validators sharing `s` would register
 identical roots, and one validator's opening would reveal the status of every
@@ -394,30 +321,22 @@ validator in the fleet for the rest of the epoch.
 A validator MUST NOT derive leaves in a way that relates them to one another, for
 example as a hash chain, since opening one leaf would then expose others.
 
-Activation is a property of the canonical state, not of the validator's broadcast
-history: an inclusion in an orphaned block never enters the queue. A validator
-whose pending entry activates at or before epoch `e` evaluates the committed
-branch for `e`, including the subnet subscription lookahead, with that entry,
-since verifiers will hold it by then.
-
-The secret `s` is key material. Anyone holding it can compute every future draw,
-and nothing on chain reveals the compromise. It SHOULD be stored with the same
-care as the signing key.
+The secret `s` is key material, as EIP-8321 says of the chain secret. Anyone
+holding it can compute every future draw, and nothing on chain reveals the
+compromise.
 
 ### Sunset of the legacy path
 
-The legacy branch of `is_aggregator`, the `selection_proof` field, and the gossip
-rule that verifies it are transitional and SHOULD be removed in a later fork after
-registration has saturated, naturally the fork that retires BLS validator keys. At
-that point the following are removed:
+The legacy branch of `is_aggregator` and the gossip rules that verify
+`selection_proof` are transitional and SHOULD be removed in a later fork after
+registration has saturated, naturally the fork that retires BLS validator keys,
+as for EIP-8321's BLS reveal. At that point:
 
-- `DOMAIN_SELECTION_PROOF`
-- `get_slot_signature`
-- the `selection_proof` field of `AggregateAndProof`
-
-and initial commitments move into validator onboarding, as EIP-8321 anticipates
-for its RANDAO commitment, after which the registration operation is no longer
-needed and can be deprecated alongside the legacy path.
+- `get_slot_signature` and the `selection_proof` field of `AggregateAndProof`
+  are removed; `DOMAIN_SELECTION_PROOF` remains as the seed domain of the draw.
+- Initial commitments move into validator onboarding, as EIP-8321 anticipates
+  for its RANDAO commitment, after which the registration operation is no
+  longer needed and can be deprecated.
 
 ## Rationale
 
@@ -455,30 +374,19 @@ a fair draw however it was chosen.
 
 ### Why registrations are delayed
 
-`AGGREGATOR_COMMITMENT_REGISTRATION_DELAY` is bounded below by `MIN_SEED_LOOKAHEAD + 2`.
-The seed for epoch `e` is derived from the RANDAO mix of epoch `e - 2`, so a
-shorter delay would let a registrant see the seed its first leaves are drawn
-against and grind the tree accordingly. This mirrors the constraint in EIP-8321.
+For the reason derived in EIP-8321: the seed for epoch `e` is fixed at the end
+of `e - 2`, so a delay shorter than `MIN_SEED_LOOKAHEAD + 2` would let a
+registrant see the seed its first leaves are drawn against and grind the tree
+against it.
 
-### Why registration is one-time and at most one may be pending
+### Why registration is one-time
 
-A commitment is registered once and never updated, as in EIP-8321. The tree is
-sized to outlast the validator, so rotation is never needed for exhaustion, and a
-lost secret is treated like a lost signing key, recovered by exiting and
-re-entering rather than by a protocol operation.
-
-Replay safety follows: a registration is valid only while the validator's entry
-is unset, and the first inclusion falsifies that. While the registration is
-merely pending the entry is still unset, and the one-pending rule rejects a second
-submission, so there is no window in which a replay has any effect. The
-one-pending rule also stops a single validator filling a block's entire
-`MAX_AGGREGATOR_COMMITMENT_REGISTRATIONS` budget with registrations for itself,
-since registrations are free and self-signed.
-
-One-time registration is also what lets `is_aggregator` read the entry from any
-state at or after the attestation's epoch: an entry is either unset or carries the
-activation epoch it has always had, so nothing a later state holds can contradict
-what an earlier one held.
+Registration is one-time and replay-safe for the reasons in EIP-8321: the tree
+is sized to outlast the validator, a lost secret is recovered by exiting and
+re-entering, and a registration is valid only while the entry is unset, which the
+first inclusion falsifies. Writing the entry at inclusion, with its activation
+epoch inside it, means there is no pending window and no need for EIP-8321's
+one-pending rule.
 
 ### Indexing by epoch
 
@@ -490,17 +398,25 @@ than to chain age, and lets leaf 0 be the first usable index.
 
 ### Tree depth
 
-Registration is one-time, so the tree must outlast the validator. Depth 24 gives
-about 204 years at one leaf per epoch and 12 second slots, or 102 years at 6
-second slots, for an 800 byte opening. Lifetime is exponential in depth while
-opening size is linear, so the headroom is cheap: each extra level costs 32 bytes
-per aggregate and doubles the lifetime. Keygen under the recommended derivation is
-about `3 * 2**depth` hashes (leaf derivation, leaf hash, internal nodes), on the
-order of ten seconds per validator at depth 24.
+Registration is one-time and running past the last leaf disables aggregation
+until the validator exits and re-enters, so the tree must outlast the validator.
+Depth 24 gives about 204 years at one leaf per epoch and 12 second slots, or 102
+years at 6 second slots, for an 800 byte opening. Lifetime is exponential in
+depth while opening size is linear, so the headroom is cheap: each extra level
+costs 32 bytes per aggregate and doubles the lifetime. Keygen under the
+recommended derivation is about `3 * 2**depth` hashes (leaf derivation, leaf
+hash, internal nodes), on the order of ten seconds per validator at depth 24.
 
 Because `AGGREGATOR_COMMITMENT_TREE_DEPTH` is the length of the SSZ `branch`
 vector, changing it later changes the `AggregateAndProof` type and invalidates
 every registered commitment.
+
+Per duty, the draw needs only `v_i` and the seed, so a validator SHOULD evaluate
+it first and build the branch only on a win. An opening needs the
+`AGGREGATOR_COMMITMENT_TREE_DEPTH` sibling nodes, so a validator holding only
+`s` would rebuild the whole tree for it; caching the top `depth - k` levels and
+rebuilding only the `2**k` leaf subtree containing the duty leaf costs 256 KB per
+validator and about 12,000 hashes per opening with `k = 12`.
 
 ## Backwards Compatibility
 
@@ -508,11 +424,11 @@ This is a consensus change requiring a hard fork. `AggregateAndProof` changes, s
 the `beacon_aggregate_and_proof` topic requires a new fork digest.
 
 Within the fork, the change is backwards compatible from the validator's
-perspective: every commitment is unset at the fork, and unregistered validators
+perspective: every entry is unregistered at the fork, and unregistered validators
 continue to self-select with the BLS selection proof exactly as today. At
 `MAX_AGGREGATOR_COMMITMENT_REGISTRATIONS = 128` per block, the full current
-validator set (~1M) can register in under two days of full blocks. There is no
-deadline; the legacy path is removed at the fork described under Sunset.
+validator set (~1M) can register in under two days of full blocks, and there is
+no deadline.
 
 ## Test Cases
 
@@ -524,11 +440,10 @@ test suite.
 ### Grinding at registration
 
 The registration delay means a registrant never knows the seed that any of its
-leaves will be drawn against, assuming it cannot predict the RANDAO contributions
-that land between inclusion and the fixing of the target seed. That holds today
-and after migration to hash-chain reveals, but an attacker that already holds a
-CRQC during the transition could predict every remaining legacy BLS reveal and
-grind a registration against them. EIP-8321 records the same caveat.
+leaves will be drawn against. EIP-8321's caveat applies unchanged: an attacker
+that already holds a CRQC during the transition could predict every remaining
+legacy BLS RANDAO reveal, and so future seeds, and grind a registration against
+them.
 
 ### RANDAO bias
 
@@ -550,12 +465,6 @@ total. Once BLS is broken, a CRQC holder could do this to every still-unregister
 validator, which is why the registration signature moves to the post-quantum key,
 and initial commitments to deposit time, at the fork that retires BLS keys. The
 same applies to EIP-8321's registration.
-
-### Exhaustion
-
-Running past the last leaf silently disables aggregation and cannot be recovered
-without exiting, so the depth is chosen so that exhaustion is not expected within
-any validator's service life.
 
 ### Distributed validators
 
