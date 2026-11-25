@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 pragma solidity ^0.8.24;
 
-/// @notice Minimal canonical paymaster for EIP-8141-style frame transactions.
-/// @dev VERIFY frame calldata is expected to be exactly:
-///      r (32 bytes) || s (32 bytes) || v (1 byte)
-///      The signature is checked against TXPARAM(0x08), i.e. the canonical tx sig hash.
-///      On success, the contract calls APPROVE with scope=0x1 and offset/length=0 to approve payment.
-///      This implementation supports only a single secp256k1 signer recovered via ecrecover.
-///      ERC-1271 and other contract-signature schemes are not supported.
+/// @notice Canonical paymaster for EIP-8141 frame transactions.
+/// @dev A `pay` frame that targets an instance carries empty calldata.
+///      The transaction must include a leading `PROOF` frame with target `SECP256K1_VERIFIER`,
+///      resolved key `owner` left-padded to 32 bytes, and `msg` zero (the owner's secp256k1
+///      signature over the canonical signature hash). The protocol verifies every `PROOF` frame
+///      before any non-`PROOF` frame executes, so the paymaster checks `HASCLAIM` and approves
+///      payment. Solidity cannot emit `HASCLAIM` or `APPROVE`, so that pay path runs in
+///      `CanonicalPaymasterPay.yul`, which this contract delegatecalls; `APPROVE` under
+///      `DELEGATECALL` approves this contract as payer.
+///      Ether leaves an instance only as payment for a transaction, or through a withdrawal
+///      that the owner requests and, after `WITHDRAWAL_DELAY`, executes.
 contract CanonicalPaymaster {
     uint256 public constant WITHDRAWAL_DELAY = 12 hours;
 
-    // secp256k1n / 2
-    uint256 private constant SECP256K1N_DIV_2 =
-        0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
+    // Immutables are part of the runtime code. Canonical instances are deployed with the pay helper's fixed
+    // address and with the SECP256K1_VERIFIER address, which EIP-8141 has yet to assign, so they share their
+    // runtime code and nodes recognize them by code match.
+    address public immutable payHelper;
+    address public immutable secp256k1Verifier;
 
     // Stored in contract storage instead of immutable so the deployed runtime code
     // is identical across all instances and can be recognized canonically by code match.
@@ -26,7 +32,7 @@ contract CanonicalPaymaster {
 
     error NotOwner();
     error ZeroAddress();
-    error InvalidSignature();
+    error InvalidClaim();
     error NoPendingWithdrawal();
     error WithdrawalNotReady();
     error TransferFailed();
@@ -34,36 +40,29 @@ contract CanonicalPaymaster {
     event WithdrawalRequested(address indexed to, uint256 amount, uint256 readyAt);
     event WithdrawalExecuted(address indexed to, uint256 amount);
 
-    constructor(address owner_) payable {
-        if (owner_ == address(0)) revert ZeroAddress();
+    constructor(address owner_, address payHelper_, address secp256k1Verifier_) payable {
+        if (owner_ == address(0) || payHelper_ == address(0) || secp256k1Verifier_ == address(0)) {
+            revert ZeroAddress();
+        }
         owner = owner_;
+        payHelper = payHelper_;
+        secp256k1Verifier = secp256k1Verifier_;
     }
 
     receive() external payable {}
 
-    /// @dev Raw paymaster validation entrypoint.
-    ///      Use as the target of the PAY/VERIFY frame.
+    /// @dev Raw paymaster validation entrypoint: the target of the `pay` frame.
+    ///      Expects empty calldata; checks for the owner's `PROOF` frame via `HASCLAIM`.
     fallback() external payable {
-        if (msg.data.length != 65) revert InvalidSignature();
+        if (msg.data.length != 0) revert InvalidClaim();
 
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-
-        assembly {
-            r := calldataload(0x00)
-            s := calldataload(0x20)
-            v := byte(0, calldataload(0x40))
+        (bool ok, bytes memory ret) =
+            payHelper.delegatecall(abi.encode(secp256k1Verifier, owner));
+        if (!ok) {
+            assembly {
+                revert(add(ret, 0x20), mload(ret))
+            }
         }
-
-        if (uint256(s) > SECP256K1N_DIV_2) revert InvalidSignature();
-        if (v != 27 && v != 28) revert InvalidSignature();
-
-        if (ecrecover(_txSigHash(), v, r, s) != owner) {
-            revert InvalidSignature();
-        }
-
-        _approvePayer();
     }
 
     function requestWithdrawal(address payable to, uint256 amount) external {
@@ -95,20 +94,5 @@ contract CanonicalPaymaster {
         if (!ok) revert TransferFailed();
 
         emit WithdrawalExecuted(to, amount);
-    }
-
-    function _txSigHash() internal returns (bytes32 sigHash) {
-        assembly {
-            // TXPARAM(0x08) -> canonical frame transaction signature hash
-            sigHash := verbatim_0i_1o(hex"6008b0")
-        }
-    }
-
-    function _approvePayer() internal {
-        assembly {
-            // APPROVE(scope=0x1, length=0, offset=0)
-            // Push order: scope, length, offset
-            verbatim_0i_0o(hex"600160006000aa")
-        }
     }
 }
